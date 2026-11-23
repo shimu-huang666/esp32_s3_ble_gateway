@@ -23,10 +23,54 @@
 #define LCD_HEIGHT 320
 #define LCD_DRAW_ROWS 24
 #define LCD_HOST SPI3_HOST
+#define SCREEN_IDLE_TIMEOUT_MS 60000U
 
 static const char *TAG = "gateway_display";
 static const gpio_num_t LCD_BACKLIGHT = GPIO_NUM_5;
 static const gpio_num_t TOUCH_RESET = GPIO_NUM_2;
+
+static esp_err_t set_screen_enabled(esp_lcd_panel_handle_t panel, bool enabled)
+{
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_disp_on_off(panel, enabled), TAG, "LCD output");
+    return gpio_set_level(LCD_BACKLIGHT, enabled);
+}
+
+static void wake_screen_on_touch(lv_event_t *event)
+{
+    lv_obj_t *wake_target = lv_event_get_target_obj(event);
+    esp_lcd_panel_handle_t panel = lv_obj_get_user_data(wake_target);
+    ESP_RETURN_VOID_ON_ERROR(set_screen_enabled(panel, true), TAG, "Wake screen");
+
+    /* 消耗完整的唤醒手势，松手前不会触发下方的角度按钮。 */
+    lv_indev_wait_release(lv_indev_active());
+    lv_obj_add_flag(wake_target, LV_OBJ_FLAG_HIDDEN);
+    lv_display_trigger_activity(lv_obj_get_display(wake_target));
+    ESP_LOGI(TAG, "Screen woke on touch");
+}
+
+static void check_screen_idle(lv_timer_t *timer)
+{
+    lv_obj_t *wake_target = lv_timer_get_user_data(timer);
+    lv_display_t *display = lv_obj_get_display(wake_target);
+    if (!lv_obj_has_flag(wake_target, LV_OBJ_FLAG_HIDDEN) ||
+        lv_display_get_inactive_time(display) < SCREEN_IDLE_TIMEOUT_MS)
+    {
+        return;
+    }
+
+    esp_lcd_panel_handle_t panel = lv_obj_get_user_data(wake_target);
+    const esp_err_t result = set_screen_enabled(panel, false);
+    if (result != ESP_OK)
+    {
+        ESP_LOGW(TAG, "Screen standby failed: %s", esp_err_to_name(result));
+        lv_display_trigger_activity(display);
+        return;
+    }
+
+    lv_obj_remove_flag(wake_target, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_update_layout(wake_target);
+    ESP_LOGI(TAG, "Screen off after inactivity");
+}
 
 static esp_err_t configure_panel(esp_lcd_panel_io_handle_t io, esp_lcd_panel_handle_t panel)
 {
@@ -173,12 +217,27 @@ esp_err_t gateway_display_init(lv_display_t **display)
     const lvgl_port_touch_cfg_t touch_config = {.disp = lv_display, .handle = touch};
     lv_touch = lvgl_port_add_touch(&touch_config);
     ESP_GOTO_ON_FALSE(lv_touch, ESP_ERR_NO_MEM, fail, TAG, "LVGL touch");
-    ESP_GOTO_ON_ERROR(esp_lcd_panel_disp_on_off(panel, true), fail, TAG, "LCD on");
-    ESP_GOTO_ON_ERROR(gpio_set_level(LCD_BACKLIGHT, 1), fail, TAG, "Backlight on");
+    ESP_GOTO_ON_ERROR(set_screen_enabled(panel, true), fail, TAG, "Screen on");
+
+    ESP_GOTO_ON_FALSE(lvgl_port_lock(0), ESP_ERR_TIMEOUT, fail, TAG, "Screen idle setup");
+    lv_obj_t *wake_target = lv_obj_create(lv_display_get_layer_top(lv_display));
+    lv_obj_remove_style_all(wake_target);
+    lv_obj_set_pos(wake_target, 0, 0);
+    lv_obj_set_size(wake_target, lv_display_get_horizontal_resolution(lv_display),
+                    lv_display_get_vertical_resolution(lv_display));
+    lv_obj_remove_flag(wake_target, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(wake_target, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_user_data(wake_target, panel);
+    lv_obj_add_event_cb(wake_target, wake_screen_on_touch, LV_EVENT_PRESSED, NULL);
+    lv_display_trigger_activity(lv_display);
+    lv_timer_create(check_screen_idle, 1000, wake_target);
+    lvgl_port_unlock();
+
     *display = lv_display;
     return ESP_OK;
 
 fail:
+    gpio_set_level(LCD_BACKLIGHT, 0);
     if (lv_touch)
     {
         lvgl_port_remove_touch(lv_touch);
