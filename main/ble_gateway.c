@@ -23,7 +23,7 @@
 
 /**
  * @file ble_gateway.c
- * @brief S3 中央设备：扫描 C3、连接、发现通信特征、订阅通知并定时发送 PING。
+ * @brief S3 中央设备：连接 C3，处理触屏角度命令和定时 PING/PONG。
  * @note GAP（Generic Access Profile，通用访问规范）管理发现与连接；
  *       GATT（Generic Attribute Profile，通用属性规范）管理服务、特征和数据访问。
  */
@@ -35,6 +35,8 @@
 #include "ble_gateway.h"
 #include "ble_protocol.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "host/ble_hs.h"
 #include "host/util/util.h"
 #include "esp_central.h"
@@ -48,6 +50,25 @@ static const ble_uuid128_t SERVICE_UUID = BLE_LINK_SERVICE_UUID;
 static const ble_uuid128_t CHARACTERISTIC_UUID = BLE_LINK_CHARACTERISTIC_UUID;
 /** 请求常量；数组含 '\0'，发送时只取前四字节。 */
 static const char PING[] = BLE_LINK_PING;
+static const uint32_t ANGLE_TIMEOUT_MS = 1500;
+
+typedef enum
+{
+    GATT_WRITE_NONE,
+    GATT_WRITE_PING,
+    GATT_WRITE_ANGLE,
+} gatt_write_t;
+
+typedef struct
+{
+    uint32_t connection_id;
+    uint16_t angle;
+} angle_request_t;
+
+/* 任务之间只传递命令及状态副本，蓝牙状态由 NimBLE 主机单独维护。 */
+static QueueHandle_t s_angle_requests;
+static QueueHandle_t s_status_updates;
+static struct ble_npl_event s_angle_request_event;
 
 /* 以下状态及定时回调均由 NimBLE 主机事件队列管理，不由额外应用任务直接读写。 */
 /** 本机蓝牙地址类型，主机同步后确定。 */
@@ -56,8 +77,12 @@ static uint8_t s_own_address_type;
 static uint16_t s_connection_handle = BLE_HS_CONN_HANDLE_NONE;
 /** 对端通信特征的值句柄，发现前或断连后为 0。 */
 static uint16_t s_characteristic_handle;
-/** 上一次 PING 的写请求尚未完成，防止重复提交。 */
-static bool s_write_pending;
+static gatt_write_t s_active_write;
+static ble_gateway_status_t s_status;
+static uint16_t s_requested_angle;
+static bool s_angle_sent;
+static ble_npl_time_t s_angle_deadline;
+static struct ble_npl_callout s_angle_timer;
 /** PING 单次定时器，发送回调中按一秒间隔重新调度。 */
 static struct ble_npl_callout s_ping_timer;
 /** 扫描或连接启动失败时，延迟一秒重新扫描。 */
@@ -65,14 +90,95 @@ static struct ble_npl_callout s_scan_retry;
 
 static int gap_event(struct ble_gap_event *event, void *argument);
 static void scan(struct ble_npl_event *event);
+static void try_write_angle(void);
+
+static void publish_status(void)
+{
+    xQueueOverwrite(s_status_updates, &s_status);
+}
+
+bool ble_gateway_request_angle(uint32_t connection_id, uint16_t angle)
+{
+    const angle_request_t request = {.connection_id = connection_id, .angle = angle};
+    if (angle > BLE_LINK_SERVO_MAX_ANGLE || xQueueSend(s_angle_requests, &request, 0) != pdTRUE)
+    {
+        return false;
+    }
+    ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &s_angle_request_event);
+    return true;
+}
+
+bool ble_gateway_take_status(ble_gateway_status_t *status)
+{
+    return xQueueReceive(s_status_updates, status, 0) == pdTRUE;
+}
+
+static void clear_link_status(void)
+{
+    ble_npl_callout_stop(&s_angle_timer);
+    s_status.link = BLE_GATEWAY_SCANNING;
+    s_status.angle_state = BLE_GATEWAY_ANGLE_IDLE;
+    s_status.has_ack_angle = false;
+    s_angle_sent = false;
+    publish_status();
+}
+
+static void finish_angle_request(ble_gateway_angle_state_t state)
+{
+    ble_npl_callout_stop(&s_angle_timer);
+    s_status.angle_state = state;
+    s_angle_sent = false;
+    publish_status();
+}
+
+static void on_angle_timeout(struct ble_npl_event *event)
+{
+    (void)event;
+    /* 已投递的旧定时器事件可能迟到，按当前请求的截止时间判断。 */
+    if (s_status.angle_state == BLE_GATEWAY_ANGLE_WAITING &&
+        (int32_t)(ble_npl_time_get() - s_angle_deadline) >= 0)
+    {
+        ESP_LOGW(TAG, "Angle %u acknowledgement timed out", (unsigned int)s_requested_angle);
+        finish_angle_request(BLE_GATEWAY_ANGLE_TIMEOUT);
+    }
+}
+
+static void on_angle_requested(struct ble_npl_event *event)
+{
+    (void)event;
+    angle_request_t request;
+    if (xQueueReceive(s_angle_requests, &request, 0) != pdTRUE)
+    {
+        return;
+    }
+    if (s_status.link != BLE_GATEWAY_READY || request.connection_id != s_status.connection_id ||
+        s_status.angle_state == BLE_GATEWAY_ANGLE_WAITING)
+    {
+        publish_status();
+        return;
+    }
+
+    s_requested_angle = request.angle;
+    s_angle_sent = false;
+    const ble_npl_time_t timeout = ble_npl_time_ms_to_ticks32(ANGLE_TIMEOUT_MS);
+    s_angle_deadline = ble_npl_time_get() + timeout;
+    if (ble_npl_callout_reset(&s_angle_timer, timeout) != BLE_NPL_OK)
+    {
+        finish_angle_request(BLE_GATEWAY_ANGLE_FAILED);
+        return;
+    }
+    s_status.angle_state = BLE_GATEWAY_ANGLE_WAITING;
+    publish_status();
+    try_write_angle();
+}
 
 /**
- * @brief 停止发送 PING，并请求断开当前连接。
- * @note 不在此处清空连接状态；收到断连事件后统一清理并重新扫描。
+ * @brief 停止发送并请求断开当前连接；连接句柄由断连事件统一清理。
  */
 static void close_connection(void)
 {
     ble_npl_callout_stop(&s_ping_timer);
+    clear_link_status();
     if (s_connection_handle != BLE_HS_CONN_HANDLE_NONE)
     {
         /* 这里只表示断开请求是否提交成功，实际断开由 GAP 事件确认。 */
@@ -85,15 +191,15 @@ static void close_connection(void)
 }
 
 /**
- * @brief 处理 PING 写请求的完成结果，解除待完成标志，失败时断开重连。
+ * @brief 释放 GATT 写入位，若有触屏命令正在排队，则用空出的写入位提交。
  * @param connection_handle 此次写操作所属连接，用于排除非当前连接的回调。
- * @param error 写操作结果；status 为 0 表示成功，不代表已收到 PONG。
+ * @param error 写操作结果；status 为 0 不代表已收到角度回执或 PONG。
  * @param attribute 写操作对应的属性，本回调未使用。
  * @param argument 发起写操作时传入的用户参数，本回调未使用。
- * @return 始终返回 0；错误通过日志和断连恢复处理。
+ * @return 始终返回 0；PING 错误触发重连，角度写入错误反馈到界面。
  */
-static int on_ping_written(uint16_t connection_handle, const struct ble_gatt_error *error,
-                           struct ble_gatt_attr *attribute, void *argument)
+static int on_command_written(uint16_t connection_handle, const struct ble_gatt_error *error,
+                              struct ble_gatt_attr *attribute, void *argument)
 {
     (void)attribute;
     (void)argument;
@@ -102,13 +208,56 @@ static int on_ping_written(uint16_t connection_handle, const struct ble_gatt_err
         return 0;
     }
 
-    s_write_pending = false;
+    const gatt_write_t completed_write = s_active_write;
+    s_active_write = GATT_WRITE_NONE;
     if (error->status != 0)
     {
-        ESP_LOGE(TAG, "PING write failed; status=%d", error->status);
-        close_connection();
+        ESP_LOGE(TAG, "Command write failed; status=%d", error->status);
+        if (completed_write == GATT_WRITE_PING)
+        {
+            close_connection();
+            return 0;
+        }
+        if (completed_write == GATT_WRITE_ANGLE && s_angle_sent)
+        {
+            finish_angle_request(BLE_GATEWAY_ANGLE_FAILED);
+        }
     }
+    try_write_angle();
     return 0;
+}
+
+static void try_write_angle(void)
+{
+    if (s_status.angle_state != BLE_GATEWAY_ANGLE_WAITING || s_angle_sent ||
+        s_active_write != GATT_WRITE_NONE)
+    {
+        return;
+    }
+    if ((int32_t)(ble_npl_time_get() - s_angle_deadline) >= 0)
+    {
+        /* 等待 PING 写入也占用同一超时预算，超时后不再迟发旧命令。 */
+        on_angle_timeout(NULL);
+        return;
+    }
+
+    char request[BLE_LINK_MESSAGE_LENGTH];
+    if (!ble_link_encode_angle(BLE_LINK_SERVO_SET, s_requested_angle, request))
+    {
+        finish_angle_request(BLE_GATEWAY_ANGLE_FAILED);
+        return;
+    }
+    int result = ble_gattc_write_flat(s_connection_handle, s_characteristic_handle, request,
+                                      sizeof(request), on_command_written, NULL);
+    if (result != 0)
+    {
+        ESP_LOGE(TAG, "Could not send servo target; status=%d", result);
+        finish_angle_request(BLE_GATEWAY_ANGLE_FAILED);
+        return;
+    }
+    s_active_write = GATT_WRITE_ANGLE;
+    s_angle_sent = true;
+    ESP_LOGI(TAG, "TX: S%03u", (unsigned int)s_requested_angle);
 }
 
 /**
@@ -119,24 +268,24 @@ static int on_ping_written(uint16_t connection_handle, const struct ble_gatt_err
 static void send_ping(struct ble_npl_event *event)
 {
     (void)event;
-    if (s_connection_handle == BLE_HS_CONN_HANDLE_NONE || s_characteristic_handle == 0)
+    if (s_status.link != BLE_GATEWAY_READY)
     {
         return;
     }
 
     /* ATT（Attribute Protocol，属性协议）写响应未返回前，不叠加提交下一次写请求。 */
-    if (!s_write_pending)
+    if (s_active_write == GATT_WRITE_NONE)
     {
-        /* result 为请求提交结果，异步完成结果由 on_ping_written() 接收。 */
+        /* result 为请求提交结果，异步完成结果由 on_command_written() 接收。 */
         int result = ble_gattc_write_flat(s_connection_handle, s_characteristic_handle, PING,
-                                          BLE_LINK_MESSAGE_LENGTH, on_ping_written, NULL);
+                                          BLE_LINK_MESSAGE_LENGTH, on_command_written, NULL);
         if (result != 0)
         {
             ESP_LOGE(TAG, "Could not send PING; status=%d", result);
             close_connection();
             return;
         }
-        s_write_pending = true;
+        s_active_write = GATT_WRITE_PING;
         ESP_LOGI(TAG, "TX: PING");
     }
 
@@ -144,7 +293,7 @@ static void send_ping(struct ble_npl_event *event)
 }
 
 /**
- * @brief 处理通知订阅结果，订阅成功后启动 PING 定时器。
+ * @brief 订阅成功后启用触屏下发，并启动 PING 定时器。
  * @param connection_handle 此次订阅操作所属连接。
  * @param error 订阅配置的写入结果，status 为 0 表示对端已确认。
  * @param attribute 写入的配置属性，本回调未使用。
@@ -167,8 +316,11 @@ static int on_subscribed(uint16_t connection_handle, const struct ble_gatt_error
         return 0;
     }
 
-    /* 等 C3 确认通知开关已写入后再发 PING，否则首个 PONG 可能无法通过通知返回。 */
+    /* 必须先确认通知开关已写入，才能接收角度设置回执和 PONG。 */
     ESP_LOGI(TAG, "BLE link ready; PONG notifications enabled");
+    ++s_status.connection_id;
+    s_status.link = BLE_GATEWAY_READY;
+    publish_status();
     ble_npl_callout_reset(&s_ping_timer, ble_npl_time_ms_to_ticks32(1000));
     return 0;
 }
@@ -291,6 +443,11 @@ static void connect_if_target(const struct ble_gap_disc_desc *advertisement)
             ESP_LOGW(TAG, "Could not start connection; status=%d", result);
             ble_npl_callout_reset(&s_scan_retry, ble_npl_time_ms_to_ticks32(1000));
         }
+        else
+        {
+            s_status.link = BLE_GATEWAY_CONNECTING;
+            publish_status();
+        }
         return;
     }
 }
@@ -317,6 +474,7 @@ static int gap_event(struct ble_gap_event *event, void *argument)
             if (event->connect.status != 0)
             {
                 ESP_LOGW(TAG, "Connection failed; status=%d", event->connect.status);
+                clear_link_status();
                 ble_npl_callout_reset(&s_scan_retry, ble_npl_time_ms_to_ticks32(1000));
                 return 0;
             }
@@ -344,7 +502,8 @@ static int gap_event(struct ble_gap_event *event, void *argument)
             peer_delete(event->disconnect.conn.conn_handle);
             s_connection_handle = BLE_HS_CONN_HANDLE_NONE;
             s_characteristic_handle = 0;
-            s_write_pending = false;
+            s_active_write = GATT_WRITE_NONE;
+            clear_link_status();
             scan(NULL);
             return 0;
 
@@ -354,16 +513,31 @@ static int gap_event(struct ble_gap_event *event, void *argument)
             {
                 /* 响应是四字节原始数据，不含 '\0'，因此按长度比较而非使用 strcmp。 */
                 char response[BLE_LINK_MESSAGE_LENGTH];
-                if (OS_MBUF_PKTLEN(event->notify_rx.om) == sizeof(response) &&
-                    ble_hs_mbuf_to_flat(event->notify_rx.om, response, sizeof(response), NULL) ==
-                        0 &&
-                    memcmp(response, BLE_LINK_PONG, sizeof(response)) == 0)
+                uint16_t angle;
+                if (OS_MBUF_PKTLEN(event->notify_rx.om) != sizeof(response) ||
+                    ble_hs_mbuf_to_flat(event->notify_rx.om, response, sizeof(response), NULL) != 0)
+                {
+                    ESP_LOGW(TAG, "Malformed notification");
+                }
+                else if (memcmp(response, BLE_LINK_PONG, sizeof(response)) == 0)
                 {
                     ESP_LOGI(TAG, "RX: PONG");
                 }
+                else if (response[0] == BLE_LINK_SERVO_ACK &&
+                         ble_link_decode_angle(response, sizeof(response), &angle))
+                {
+                    ESP_LOGI(TAG, "RX: A%03u; C3 PWM configured (position not measured)",
+                             (unsigned int)angle);
+                    if (s_angle_sent && angle == s_requested_angle)
+                    {
+                        s_status.last_ack_angle = angle;
+                        s_status.has_ack_angle = true;
+                        finish_angle_request(BLE_GATEWAY_ANGLE_IDLE);
+                    }
+                }
                 else
                 {
-                    ESP_LOGW(TAG, "Unexpected notification; expected four-byte PONG");
+                    ESP_LOGW(TAG, "Unexpected notification; expected PONG or Addd");
                 }
             }
             return 0;
@@ -388,7 +562,8 @@ static void on_reset(int reason)
     }
     s_connection_handle = BLE_HS_CONN_HANDLE_NONE;
     s_characteristic_handle = 0;
-    s_write_pending = false;
+    s_active_write = GATT_WRITE_NONE;
+    clear_link_status();
     ESP_LOGE(TAG, "NimBLE reset; reason=%d", reason);
 }
 
@@ -407,8 +582,15 @@ static void on_sync(void)
 }
 
 /** @brief 初始化网关资源，具体调用时机见 ble_gateway.h。 */
-void ble_gateway_init(void)
+esp_err_t ble_gateway_init(void)
 {
+    s_angle_requests = xQueueCreate(1, sizeof(angle_request_t));
+    s_status_updates = xQueueCreate(1, sizeof(ble_gateway_status_t));
+    if (s_angle_requests == NULL || s_status_updates == NULL)
+    {
+        return ESP_ERR_NO_MEM;
+    }
+
     ble_hs_cfg.reset_cb = on_reset;
     ble_hs_cfg.sync_cb = on_sync;
 
@@ -421,8 +603,13 @@ void ble_gateway_init(void)
     int result = peer_init(1, 4, 8, 8);
 #endif
     assert(result == 0);
-    /* 两个定时器均向主机默认事件队列投递，确保回调与连接状态更新串行执行。 */
-    ble_npl_callout_init(&s_scan_retry, nimble_port_get_dflt_eventq(), scan, NULL);
-    ble_npl_callout_init(&s_ping_timer, nimble_port_get_dflt_eventq(), send_ping, NULL);
+    /* 角度命令和定时器统一投递到主机队列，与 GATT 回调串行执行。 */
+    struct ble_npl_eventq *host_queue = nimble_port_get_dflt_eventq();
+    ble_npl_event_init(&s_angle_request_event, on_angle_requested, NULL);
+    ble_npl_callout_init(&s_angle_timer, host_queue, on_angle_timeout, NULL);
+    ble_npl_callout_init(&s_scan_retry, host_queue, scan, NULL);
+    ble_npl_callout_init(&s_ping_timer, host_queue, send_ping, NULL);
+    publish_status();
     ESP_LOGI(TAG, "Gateway initialized; PING interval is 1 s");
+    return ESP_OK;
 }

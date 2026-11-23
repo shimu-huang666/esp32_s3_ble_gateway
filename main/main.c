@@ -39,6 +39,6 @@ void app_main(void)
     ESP_ERROR_CHECK(result);
     ESP_ERROR_CHECK(nimble_port_init());
 
-    ble_gateway_init();
+    ESP_ERROR_CHECK(ble_gateway_init());
     nimble_port_freertos_init(ble_host_task);
 }
