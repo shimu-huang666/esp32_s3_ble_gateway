@@ -6,6 +6,8 @@
 
 #include "ble_gateway.h"
 #include "esp_err.h"
+#include "esp_log.h"
+#include "gateway_ui.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "nvs_flash.h"
@@ -23,7 +25,7 @@ static void ble_host_task(void *argument)
 }
 
 /**
- * @brief 应用入口：初始化持久存储和蓝牙协议栈，配置网关后启动主机任务。
+ * @brief 应用入口：初始化持久存储、蓝牙协议栈和触控界面，再启动主机任务。
  * @note 必须先配置网关的回调和定时器，再启动主机，避免事件到来时尚未就绪。
  */
 void app_main(void)
@@ -39,6 +41,11 @@ void app_main(void)
     ESP_ERROR_CHECK(result);
     ESP_ERROR_CHECK(nimble_port_init());
 
-    ble_gateway_init();
+    ESP_ERROR_CHECK(ble_gateway_init());
+    result = gateway_ui_init();
+    if (result != ESP_OK)
+    {
+        ESP_LOGE("main", "Gateway display init failed: %s", esp_err_to_name(result));
+    }
     nimble_port_freertos_init(ble_host_task);
 }
