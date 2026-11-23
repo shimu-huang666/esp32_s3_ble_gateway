@@ -1,6 +1,6 @@
-# ESP32-S3 最小 BLE 网关
+# ESP32-S3 触屏舵机网关
 
-使用 ESP-IDF v6.1，从官方空白模板建立。S3 扫描并连接 C3，每秒写入一次 PING，接收 C3 的 PONG 通知，断连后重新扫描。
+使用 ESP-IDF v6.1，适配微雪 ESP32-S3-Touch-LCD-2.8。S3 扫描并连接 C3，每秒收发 PING/PONG。通过屏幕选择 SG90 的目标角度，点「下发角度」后发送给 C3。
 
 ## 编译与烧录
 
@@ -19,6 +19,12 @@ idf.py -p COM7 flash monitor
 ```
 
 配套 C3 固件也需烧录并上电。两板通过蓝牙通信，不需要连接彼此的串口。S3 完成连接与订阅后，日志持续出现 `TX: PING` 和 `RX: PONG`。退出串口监视器使用 Ctrl+]。
+
+## 触屏控制
+
+- 240×320 竖屏。启动时探测 V1 的 CST328，V2 由 CST3530 驱动识别。串口日志会显示识别到的触控芯片。[微雪板卡资料](https://docs.waveshare.com/ESP32-S3-Touch-LCD-2.8)
+- 配套 C3 要使用支持 SG90 角度命令的固件。屏上显示「C3 在线」后，用「−5°」「回中」「+5°」选目标，再点「下发角度」。
+- 「C3 设置回执」显示 C3 最后确认的 PWM（Pulse Width Modulation，脉宽调制）目标值。收到回执后观察舵机动作，实测机械角度。1.5 秒内未确认时显示超时。断线时下发按钮停用，重新连上后可再次下发。
 
 ## 通信方式
 
@@ -70,7 +76,9 @@ PONG
 
 - main/main.c：初始化 NVS 和 NimBLE，启动官方主机任务。NVS 是 Non-Volatile Storage，片上持久存储，官方例程用它保存射频校准等数据。
 - main/ble_gateway.c：扫描、连接、服务发现、通知订阅、定时发送和断连恢复。定时器与蓝牙回调都运行在 NimBLE 事件队列中，避免额外任务共享连接状态。
-- main/ble_protocol.h：服务 UUID、特征 UUID 与 PING/PONG 定义。两个独立仓库各保存一份，修改协议时同步两份。
+- main/ble_protocol.h：服务 UUID、特征 UUID、PING/PONG 和角度命令及回执。两个独立仓库各保存一份，修改协议时同步两份。
+- main/gateway_display.c：初始化 ST7789 液晶屏、识别触控芯片并注册 LVGL（Light and Versatile Graphics Library，轻量图形库）。
+- main/gateway_ui.c：绘制角度盘和触控按钮。用队列发送目标角度、接收蓝牙状态副本，界面刷新由 LVGL 任务处理。
 - sdkconfig.defaults：开启 NimBLE，限制为一个连接。S3 按 N16R8 的 16 MB Flash 配置；PSRAM（外部运行内存）暂不启用，本阶段用不到它。
 - 串口日志同时输出到默认 UART0 和原生 USB Serial/JTAG；具体使用开发板接出来的串口即可。
 - .clang-format：Allman 风格，左大括号独占一行，四空格缩进；.vscode/settings.json 让 C/C++ 扩展按此文件格式化。
@@ -89,7 +97,7 @@ python tests/verify_ble.py --port COM7
 
 随后保持 S3 上电，重启 C3，确认 S3 日志先断连再重新连接，并恢复 PING/PONG。再交换顺序重启 S3，检查同样的恢复行为。
 
-首次交付的验证结果见 [docs/verification.md](docs/verification.md)。本阶段不接入 INMP441、SG90 或电源控制。
+首次交付的基础 BLE 验证记录见 [docs/verification.md](docs/verification.md)。
 
 ## 官方来源
 
