@@ -28,6 +28,7 @@ typedef struct
     ble_gateway_angle_state_t angle_state;
     uint16_t last_ack_angle;
     bool has_ack_angle;
+    bool ota_mode;
 } ble_gateway_status_t;
 
 /**
@@ -42,5 +43,8 @@ bool ble_gateway_request_angle(uint32_t connection_id, uint16_t angle);
 
 /** 取出最新状态。由 LVGL 任务读取，返回 false 时界面无需刷新。 */
 bool ble_gateway_take_status(ble_gateway_status_t *status);
+
+/** 切换手机升级模式。断开和恢复连接由 NimBLE 主机事件队列处理。 */
+void ble_gateway_toggle_ota(void);
 
 #endif

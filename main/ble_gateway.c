@@ -41,9 +41,13 @@
 #include "host/util/util.h"
 #include "esp_central.h"
 #include "nimble/nimble_port.h"
+#include "ota_update.h"
+#include "services/gap/ble_svc_gap.h"
+#include "services/gatt/ble_svc_gatt.h"
 
 /** 日志标签，用于区分网关模块的输出。 */
 static const char *TAG = "ble_gateway";
+static const char DEVICE_NAME[] = "BLE-S3-Gateway";
 /** 扫描及服务发现的目标标识。 */
 static const ble_uuid128_t SERVICE_UUID = BLE_LINK_SERVICE_UUID;
 /** 收发特征标识。 */
@@ -69,12 +73,14 @@ typedef struct
 static QueueHandle_t s_angle_requests;
 static QueueHandle_t s_status_updates;
 static struct ble_npl_event s_angle_request_event;
+static struct ble_npl_event s_ota_toggle_event;
 
 /* 以下状态及定时回调均由 NimBLE 主机事件队列管理，不由额外应用任务直接读写。 */
 /** 本机蓝牙地址类型，主机同步后确定。 */
 static uint8_t s_own_address_type;
 /** 当前连接标识，BLE_HS_CONN_HANDLE_NONE 表示未连接。 */
 static uint16_t s_connection_handle = BLE_HS_CONN_HANDLE_NONE;
+static uint16_t s_ota_phone = BLE_HS_CONN_HANDLE_NONE;
 /** 对端通信特征的值句柄，发现前或断连后为 0。 */
 static uint16_t s_characteristic_handle;
 static gatt_write_t s_active_write;
@@ -85,10 +91,12 @@ static ble_npl_time_t s_angle_deadline;
 static struct ble_npl_callout s_angle_timer;
 /** PING 单次定时器，发送回调中按一秒间隔重新调度。 */
 static struct ble_npl_callout s_ping_timer;
-/** 扫描或连接启动失败时，延迟一秒重新扫描。 */
-static struct ble_npl_callout s_scan_retry;
+/** 当前蓝牙模式启动失败时，延迟一秒再试。 */
+static struct ble_npl_callout s_radio_retry;
 
 static int gap_event(struct ble_gap_event *event, void *argument);
+static int ota_gap_event(struct ble_gap_event *event, void *argument);
+static void resume_radio(struct ble_npl_event *event);
 static void scan(struct ble_npl_event *event);
 static void try_write_angle(void);
 
@@ -111,6 +119,11 @@ bool ble_gateway_request_angle(uint32_t connection_id, uint16_t angle)
 bool ble_gateway_take_status(ble_gateway_status_t *status)
 {
     return xQueueReceive(s_status_updates, status, 0) == pdTRUE;
+}
+
+void ble_gateway_toggle_ota(void)
+{
+    ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &s_ota_toggle_event);
 }
 
 static void clear_link_status(void)
@@ -203,7 +216,7 @@ static int on_command_written(uint16_t connection_handle, const struct ble_gatt_
 {
     (void)attribute;
     (void)argument;
-    if (connection_handle != s_connection_handle)
+    if (s_status.ota_mode || connection_handle != s_connection_handle)
     {
         return 0;
     }
@@ -305,7 +318,7 @@ static int on_subscribed(uint16_t connection_handle, const struct ble_gatt_error
 {
     (void)attribute;
     (void)argument;
-    if (connection_handle != s_connection_handle)
+    if (s_status.ota_mode || connection_handle != s_connection_handle)
     {
         return 0;
     }
@@ -335,7 +348,7 @@ static int on_subscribed(uint16_t connection_handle, const struct ble_gatt_error
 static void on_discovery_complete(const struct peer *peer, int status, void *argument)
 {
     (void)argument;
-    if (peer->conn_handle != s_connection_handle)
+    if (s_status.ota_mode || peer->conn_handle != s_connection_handle)
     {
         return;
     }
@@ -382,7 +395,8 @@ static void on_discovery_complete(const struct peer *peer, int status, void *arg
 static void scan(struct ble_npl_event *event)
 {
     (void)event;
-    if (s_connection_handle != BLE_HS_CONN_HANDLE_NONE || ble_gap_conn_active() ||
+    if (s_status.ota_mode || s_connection_handle != BLE_HS_CONN_HANDLE_NONE ||
+        ble_gap_conn_active() ||
         ble_gap_disc_active())
     {
         return;
@@ -397,10 +411,140 @@ static void scan(struct ble_npl_event *event)
     if (result != 0)
     {
         ESP_LOGW(TAG, "Scan failed; status=%d, retrying in 1 s", result);
-        ble_npl_callout_reset(&s_scan_retry, ble_npl_time_ms_to_ticks32(1000));
+        ble_npl_callout_reset(&s_radio_retry, ble_npl_time_ms_to_ticks32(1000));
         return;
     }
     ESP_LOGI(TAG, "Scanning for C3 PING/PONG service");
+    ota_update_ble_ready();
+}
+
+static int advertise_ota(void)
+{
+    ble_uuid16_t ota_uuid = BLE_UUID16_INIT(OTA_SERVICE_UUID16);
+    const struct ble_hs_adv_fields fields = {
+        .flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP,
+        .name = (const uint8_t *)DEVICE_NAME,
+        .name_len = sizeof(DEVICE_NAME) - 1,
+        .name_is_complete = 1,
+        .uuids16 = &ota_uuid,
+        .num_uuids16 = 1,
+        .uuids16_is_complete = 1,
+    };
+    int result = ble_gap_adv_set_fields(&fields);
+    if (result == 0)
+    {
+        const struct ble_gap_adv_params parameters = {
+            .conn_mode = BLE_GAP_CONN_MODE_UND,
+            .disc_mode = BLE_GAP_DISC_MODE_GEN,
+        };
+        result = ble_gap_adv_start(s_own_address_type, NULL, BLE_HS_FOREVER, &parameters,
+                                   ota_gap_event, NULL);
+    }
+    if (result == 0)
+    {
+        ESP_LOGI(TAG, "OTA advertising as %s", DEVICE_NAME);
+        ota_update_ble_ready();
+    }
+    return result;
+}
+
+/* 先等旧连接的 GAP 断开事件，再启动当前模式，确保单连接可用。 */
+static void resume_radio(struct ble_npl_event *event)
+{
+    (void)event;
+    if (!ble_hs_synced())
+    {
+        return;
+    }
+
+    int result = 0;
+    if (s_status.ota_mode)
+    {
+        if (s_connection_handle != BLE_HS_CONN_HANDLE_NONE)
+        {
+            result = ble_gap_terminate(s_connection_handle, BLE_ERR_REM_USER_CONN_TERM);
+        }
+        else if (ble_gap_conn_active())
+        {
+            result = ble_gap_conn_cancel();
+        }
+        else if (s_ota_phone == BLE_HS_CONN_HANDLE_NONE && !ble_gap_adv_active())
+        {
+            if (ble_gap_disc_active())
+            {
+                result = ble_gap_disc_cancel();
+            }
+            if (result == 0)
+            {
+                result = advertise_ota();
+            }
+        }
+    }
+    else if (s_ota_phone != BLE_HS_CONN_HANDLE_NONE)
+    {
+        result = ble_gap_terminate(s_ota_phone, BLE_ERR_REM_USER_CONN_TERM);
+    }
+    else
+    {
+        if (ble_gap_adv_active())
+        {
+            result = ble_gap_adv_stop();
+        }
+        if (result == 0)
+        {
+            scan(NULL);
+        }
+    }
+
+    if (result != 0 && result != BLE_HS_EALREADY)
+    {
+        ESP_LOGW(TAG, "Could not switch BLE mode; status=%d, retrying in 1 s", result);
+        ble_npl_callout_reset(&s_radio_retry, ble_npl_time_ms_to_ticks32(1000));
+    }
+}
+
+static void toggle_ota_mode(struct ble_npl_event *event)
+{
+    (void)event;
+    s_status.ota_mode = !s_status.ota_mode;
+    if (!s_status.ota_mode)
+    {
+        ota_update_link_reset();
+    }
+    ble_npl_callout_stop(&s_radio_retry);
+    ble_npl_callout_stop(&s_ping_timer);
+    clear_link_status();
+    resume_radio(NULL);
+}
+
+static int ota_gap_event(struct ble_gap_event *event, void *argument)
+{
+    (void)argument;
+    if (event->type != BLE_GAP_EVENT_CONNECT || s_status.ota_mode)
+    {
+        ota_update_gap_event(event);
+    }
+
+    switch (event->type)
+    {
+        case BLE_GAP_EVENT_CONNECT:
+            if (event->connect.status == 0)
+            {
+                s_ota_phone = event->connect.conn_handle;
+            }
+            resume_radio(NULL);
+            break;
+        case BLE_GAP_EVENT_DISCONNECT:
+            s_ota_phone = BLE_HS_CONN_HANDLE_NONE;
+            resume_radio(NULL);
+            break;
+        case BLE_GAP_EVENT_ADV_COMPLETE:
+            resume_radio(NULL);
+            break;
+        default:
+            break;
+    }
+    return 0;
 }
 
 /**
@@ -410,7 +554,7 @@ static void scan(struct ble_npl_event *event)
  */
 static void connect_if_target(const struct ble_gap_disc_desc *advertisement)
 {
-    if (advertisement->event_type != BLE_HCI_ADV_RPT_EVTYPE_ADV_IND)
+    if (s_status.ota_mode || advertisement->event_type != BLE_HCI_ADV_RPT_EVTYPE_ADV_IND)
     {
         return;
     }
@@ -441,7 +585,7 @@ static void connect_if_target(const struct ble_gap_disc_desc *advertisement)
         if (result != 0)
         {
             ESP_LOGW(TAG, "Could not start connection; status=%d", result);
-            ble_npl_callout_reset(&s_scan_retry, ble_npl_time_ms_to_ticks32(1000));
+            ble_npl_callout_reset(&s_radio_retry, ble_npl_time_ms_to_ticks32(1000));
         }
         else
         {
@@ -475,12 +619,17 @@ static int gap_event(struct ble_gap_event *event, void *argument)
             {
                 ESP_LOGW(TAG, "Connection failed; status=%d", event->connect.status);
                 clear_link_status();
-                ble_npl_callout_reset(&s_scan_retry, ble_npl_time_ms_to_ticks32(1000));
+                ble_npl_callout_reset(&s_radio_retry, ble_npl_time_ms_to_ticks32(1000));
                 return 0;
             }
 
             s_connection_handle = event->connect.conn_handle;
             ESP_LOGI(TAG, "Connected; handle=%u", s_connection_handle);
+            if (s_status.ota_mode)
+            {
+                resume_radio(NULL);
+                return 0;
+            }
             /* 先登记对端，再异步发现目标服务；完成后才订阅通知。 */
             result = peer_add(s_connection_handle);
             if (result == 0)
@@ -504,11 +653,11 @@ static int gap_event(struct ble_gap_event *event, void *argument)
             s_characteristic_handle = 0;
             s_active_write = GATT_WRITE_NONE;
             clear_link_status();
-            scan(NULL);
+            resume_radio(NULL);
             return 0;
 
         case BLE_GAP_EVENT_NOTIFY_RX:
-            if (event->notify_rx.conn_handle == s_connection_handle &&
+            if (!s_status.ota_mode && event->notify_rx.conn_handle == s_connection_handle &&
                 event->notify_rx.attr_handle == s_characteristic_handle)
             {
                 /* 响应是四字节原始数据，不含 '\0'，因此按长度比较而非使用 strcmp。 */
@@ -555,12 +704,14 @@ static int gap_event(struct ble_gap_event *event, void *argument)
 static void on_reset(int reason)
 {
     ble_npl_callout_stop(&s_ping_timer);
-    ble_npl_callout_stop(&s_scan_retry);
+    ble_npl_callout_stop(&s_radio_retry);
     if (s_connection_handle != BLE_HS_CONN_HANDLE_NONE)
     {
         peer_delete(s_connection_handle);
     }
     s_connection_handle = BLE_HS_CONN_HANDLE_NONE;
+    s_ota_phone = BLE_HS_CONN_HANDLE_NONE;
+    ota_update_link_reset();
     s_characteristic_handle = 0;
     s_active_write = GATT_WRITE_NONE;
     clear_link_status();
@@ -578,7 +729,7 @@ static void on_sync(void)
     assert(result == 0);
     result = ble_hs_id_infer_auto(0, &s_own_address_type);
     assert(result == 0);
-    scan(NULL);
+    resume_radio(NULL);
 }
 
 /** @brief 初始化网关资源，具体调用时机见 ble_gateway.h。 */
@@ -593,6 +744,12 @@ esp_err_t ble_gateway_init(void)
 
     ble_hs_cfg.reset_cb = on_reset;
     ble_hs_cfg.sync_cb = on_sync;
+    ble_svc_gap_init();
+    ble_svc_gatt_init();
+    if (ble_svc_gap_device_name_set(DEVICE_NAME) != 0)
+    {
+        return ESP_FAIL;
+    }
 
     /* 发现缓存最多容纳 1 个对端、4 个服务、8 个特征和 8 个描述符。
      * 启用包含服务发现时，还需配置最多 4 个包含服务条目；按 SDK 配置选择接口签名。
@@ -606,8 +763,9 @@ esp_err_t ble_gateway_init(void)
     /* 角度命令和定时器统一投递到主机队列，与 GATT 回调串行执行。 */
     struct ble_npl_eventq *host_queue = nimble_port_get_dflt_eventq();
     ble_npl_event_init(&s_angle_request_event, on_angle_requested, NULL);
+    ble_npl_event_init(&s_ota_toggle_event, toggle_ota_mode, NULL);
     ble_npl_callout_init(&s_angle_timer, host_queue, on_angle_timeout, NULL);
-    ble_npl_callout_init(&s_scan_retry, host_queue, scan, NULL);
+    ble_npl_callout_init(&s_radio_retry, host_queue, resume_radio, NULL);
     ble_npl_callout_init(&s_ping_timer, host_queue, send_ping, NULL);
     publish_status();
     ESP_LOGI(TAG, "Gateway initialized; PING interval is 1 s");

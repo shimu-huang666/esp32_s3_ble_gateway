@@ -44,6 +44,7 @@ static lv_obj_t *s_center;
 static lv_obj_t *s_increase;
 static lv_obj_t *s_send;
 static lv_obj_t *s_send_label;
+static lv_obj_t *s_ota_label;
 
 static void set_fill(lv_obj_t *object, uint32_t color)
 {
@@ -118,7 +119,10 @@ static void refresh_status(void)
     const uint32_t link_ink = online ? 0xD3F6ED : 0xFFE4BC;
     set_fill(s_link_badge, online ? 0x234052 : 0x4A3B32);
     set_fill(s_link_dot, link_ink);
-    lv_label_set_text(s_link_label, link_text);
+    lv_obj_set_style_text_font(s_link_label, s_status.ota_mode ? LV_FONT_DEFAULT : &gateway_font_16,
+                               LV_PART_MAIN);
+    lv_label_set_text(s_link_label, s_status.ota_mode ? "OTA" : link_text);
+    lv_label_set_text(s_ota_label, s_status.ota_mode ? "Exit OTA" : "OTA");
     lv_obj_set_style_text_color(s_link_label, lv_color_hex(link_ink), LV_PART_MAIN);
 
     const char *reply_text = "等待 C3 连接";
@@ -147,7 +151,9 @@ static void refresh_status(void)
                 break;
         }
     }
-    lv_label_set_text(s_reply_label, reply_text);
+    lv_obj_set_style_text_font(s_reply_label, s_status.ota_mode ? LV_FONT_DEFAULT : &gateway_font_16,
+                               LV_PART_MAIN);
+    lv_label_set_text(s_reply_label, s_status.ota_mode ? "ESP BLE OTA" : reply_text);
     if (s_status.has_ack_angle)
     {
         lv_label_set_text_fmt(s_reply_value, "%s%u°", show_previous ? "上次 " : "",
@@ -207,6 +213,12 @@ static void send_target_angle(lv_event_t *event)
                                    : BLE_GATEWAY_ANGLE_FAILED;
         refresh_status();
     }
+}
+
+static void toggle_ota(lv_event_t *event)
+{
+    (void)event;
+    ble_gateway_toggle_ota();
 }
 
 static void create_dial(lv_obj_t *screen)
@@ -292,8 +304,11 @@ static void create_screen(lv_obj_t *screen)
     s_decrease = create_button(screen, "-5°", 12, 219, 68, false, change_target_angle);
     s_center = create_button(screen, "回中", 86, 219, 68, false, change_target_angle);
     s_increase = create_button(screen, "+5°", 160, 219, 68, false, change_target_angle);
-    s_send = create_button(screen, "下发角度", 12, 270, 216, true, send_target_angle);
+    s_send = create_button(screen, "下发角度", 12, 270, 142, true, send_target_angle);
     s_send_label = lv_obj_get_child(s_send, 0);
+    lv_obj_t *ota_button = create_button(screen, "OTA", 160, 270, 68, false, toggle_ota);
+    s_ota_label = lv_obj_get_child(ota_button, 0);
+    lv_obj_set_style_text_font(s_ota_label, LV_FONT_DEFAULT, LV_PART_MAIN);
     refresh_angle();
     refresh_status();
 }

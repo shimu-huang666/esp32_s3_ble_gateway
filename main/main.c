@@ -11,6 +11,7 @@
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "nvs_flash.h"
+#include "ota_update.h"
 
 /**
  * @brief 运行 NimBLE 蓝牙主机的事件循环，处理连接、收发及定时回调。
@@ -42,10 +43,12 @@ void app_main(void)
     ESP_ERROR_CHECK(nimble_port_init());
 
     ESP_ERROR_CHECK(ble_gateway_init());
+    ESP_ERROR_CHECK(ota_update_init());
     result = gateway_ui_init();
     if (result != ESP_OK)
     {
         ESP_LOGE("main", "Gateway display init failed: %s", esp_err_to_name(result));
     }
     nimble_port_freertos_init(ble_host_task);
+    ota_update_confirm_boot(result == ESP_OK);
 }
