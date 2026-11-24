@@ -20,6 +20,16 @@ idf.py -p COM7 flash monitor
 
 配套 C3 固件也需烧录并上电。两板通过蓝牙通信，不需要连接彼此的串口。S3 完成连接与订阅后，日志持续出现 `TX: PING` 和 `RX: PONG`。退出串口监视器使用 Ctrl+]。
 
+## 手机蓝牙升级
+
+首次在 ESP-IDF 插件中对 S3 执行完整的 **Build → Flash**，写入支持回滚的引导程序、双应用分区表、启动记录和应用。
+
+1. 点屏幕底部的 **OTA**。S3 断开 C3，暂停扫描和重连，广播为 **BLE-S3-Gateway**。
+2. 在安卓 [ESP BLE OTA](https://github.com/EspressifApps/esp-ble-ota-android/releases/tag/rc) 中选择 **BLE-S3-Gateway**，发送本工程生成的应用文件 `esp32_s3_ble_gateway.bin`。更新通过后 S3 重启，会自动恢复扫描 C3。新版确认要求触屏界面初始化和蓝牙扫描启动成功。
+3. 若要升级的是 C3，点 **OTA** 后在手机上选择 **BLE-C3-Controller**，发送 C3 应用文件。等 C3 重启，再点 S3 的 **Exit OTA** 恢复连接。
+
+手机使用与目标板对应的应用镜像。当前升级沿用开发用的未配对蓝牙链路。
+
 ## 触屏控制
 
 - 240×320 竖屏。启动时探测 V1 的 CST328，V2 由 CST3530 驱动识别。串口日志会显示识别到的触控芯片。[微雪板卡资料](https://docs.waveshare.com/ESP32-S3-Touch-LCD-2.8)
